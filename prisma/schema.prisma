@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Conversation {
+  id        String    @id @default(cuid())
+  title     String    @default("New chat")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+
+  @@index([updatedAt])
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  role           String
+  content        String       @db.Text
+  provider       String?
+  model          String?
+  metadata       Json?
+  createdAt      DateTime     @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  attachments    Attachment[]
+
+  @@index([conversationId, createdAt])
+}
+
+model Attachment {
+  id             String   @id @default(cuid())
+  messageId      String
+  groupId        String
+  fileName       String
+  mimeType       String
+  kind           String
+  byteSize       Int
+  frameIndex     Int?
+  frameTime      Float?
+  data           Bytes?
+  extractedText  String?  @db.Text
+  createdAt      DateTime @default(now())
+  message        Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([groupId])
+}
