@@ -4,6 +4,7 @@ import { Children, FormEvent, isValidElement, KeyboardEvent, ReactNode, useEffec
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PROVIDERS } from "@/lib/models";
+import { apiUrl } from "@/lib/api";
 
 type ConversationSummary = { id: string; title: string; updatedAt: string };
 type AttachmentInfo = { id: string; groupId: string; fileName: string; mimeType: string; kind: "image" | "document" | "video"; byteSize: number; frameIndex?: number | null; frameTime?: number | null };
@@ -83,8 +84,8 @@ function MessageAttachments({ items }: { items: AttachmentInfo[] }) {
   return <div className="message-attachments">{[...groups.values()].map((group) => {
     const first = group[0];
     if (first.kind === "document") return <div className="document-attachment" key={first.groupId}><span className="attachment-file-icon">{first.fileName.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE"}</span><span><strong>{first.fileName}</strong><small>{(first.byteSize / 1024).toFixed(0)} KB · text extracted</small></span></div>;
-    if (first.kind === "video") return <div className="video-attachment" key={first.groupId}><div className="video-frames">{group.slice().sort((a, b) => (a.frameIndex || 0) - (b.frameIndex || 0)).map((frame) => <img key={frame.id} src={`/api/attachments/${frame.id}`} alt={`${first.fileName}, frame ${frame.frameIndex}`} loading="lazy"/>)}</div><div className="video-attachment-label"><span className="video-play-icon">▶</span><span><strong>{first.fileName}</strong><small>Video · {group.length} sampled frames · audio not transcribed</small></span></div></div>;
-    return <img className="image-attachment" key={first.id} src={`/api/attachments/${first.id}`} alt={first.fileName} loading="lazy"/>;
+    if (first.kind === "video") return <div className="video-attachment" key={first.groupId}><div className="video-frames">{group.slice().sort((a, b) => (a.frameIndex || 0) - (b.frameIndex || 0)).map((frame) => <img key={frame.id} src={apiUrl(`/api/attachments/${frame.id}`)} alt={`${first.fileName}, frame ${frame.frameIndex}`} loading="lazy"/>)}</div><div className="video-attachment-label"><span className="video-play-icon">▶</span><span><strong>{first.fileName}</strong><small>Video · {group.length} sampled frames · audio not transcribed</small></span></div></div>;
+    return <img className="image-attachment" key={first.id} src={apiUrl(`/api/attachments/${first.id}`)} alt={first.fileName} loading="lazy"/>;
   })}</div>;
 }
 
@@ -143,7 +144,7 @@ export function Chat() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   async function refreshConversations() {
-    const response = await fetch("/api/conversations");
+    const response = await fetch(apiUrl("/api/conversations"), { credentials: "include" });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Could not load chats.");
     setConversations(result.conversations);
@@ -177,7 +178,7 @@ export function Chat() {
     setActiveId(id);
     setSidebarOpen(false);
     try {
-      const response = await fetch(`/api/conversations/${id}`);
+      const response = await fetch(apiUrl(`/api/conversations/${id}`), { credentials: "include" });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Could not open this chat.");
       setMessages(result.conversation.messages.map((message: Message) => ({ ...message })));
@@ -271,7 +272,7 @@ export function Chat() {
         })),
       }));
       uploadParts.forEach(({ file }) => form.append("files", file, file.name));
-      const response = await fetch("/api/chat", { method: "POST", body: form });
+      const response = await fetch(apiUrl("/api/chat"), { method: "POST", credentials: "include", body: form });
       if (!response.ok || !response.body) {
         const result = await response.json();
         throw new Error(result.error || "Could not send this message.");
@@ -324,7 +325,7 @@ export function Chat() {
   }
 
   async function deleteConversation(id: string) {
-    const response = await fetch(`/api/conversations/${id}`, { method: "DELETE" });
+    const response = await fetch(apiUrl(`/api/conversations/${id}`), { method: "DELETE", credentials: "include" });
     if (!response.ok) { const result = await response.json(); setError(result.error || "Could not delete this chat."); return; }
     setConversations((current) => current.filter((conversation) => conversation.id !== id));
     if (activeId === id) newConversation();
@@ -334,8 +335,8 @@ export function Chat() {
     event.preventDefault();
     const title = renamingTitle.trim();
     if (!title) return;
-    const response = await fetch(`/api/conversations/${id}`, {
-      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }),
+    const response = await fetch(apiUrl(`/api/conversations/${id}`), {
+      method: "PATCH", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }),
     });
     const result = await response.json();
     if (!response.ok) { setError(result.error || "Could not rename this chat."); return; }
@@ -344,7 +345,7 @@ export function Chat() {
   }
 
   async function logout() {
-    await fetch("/api/auth/logout", { method: "POST" });
+    await fetch(apiUrl("/api/auth/logout"), { method: "POST", credentials: "include" });
     window.location.reload();
   }
 

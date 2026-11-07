@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useState } from "react";
+import { apiUrl } from "@/lib/api";
 
 export function Login() {
   const [password, setPassword] = useState("");
@@ -12,8 +13,8 @@ export function Login() {
     setError("");
     setBusy(true);
     try {
-      const response = await fetch("/api/auth/login", {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }),
+      const response = await fetch(apiUrl("/api/auth/login"), {
+        method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Could not sign in.");

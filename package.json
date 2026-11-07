@@ -4,19 +4,13 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "prisma generate && next build",
+    "build": "next build",
     "start": "next start",
-    "db:generate": "prisma generate",
-    "db:push": "prisma db push",
-    "db:studio": "prisma studio"
+    "backend:dev": "python -m uvicorn backend.main:app --reload --port 8000",
+    "backend:start": "python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "^7.0.0",
-    "@prisma/client": "^7.0.0",
-    "mammoth": "^1.13.0",
     "next": "^16.0.0",
-    "pdf-parse": "^2.4.5",
-    "pg": "^8.16.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-markdown": "^10.1.0",
@@ -24,10 +18,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.1",
-    "@types/pg": "^8.15.5",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
-    "prisma": "^7.0.0",
     "typescript": "^5.9.3"
   }
 }
