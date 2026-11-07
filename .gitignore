@@ -6,7 +6,9 @@ coverage/
 .env
 .env.*
 !.env.example
-src/generated/prisma/
+frontend/.next/
+frontend/node_modules/
+frontend/src/generated/prisma/
 *.tsbuildinfo
 npm-debug.log*
 __pycache__/
