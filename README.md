@@ -12,7 +12,7 @@ astra/
 └── README.md
 ```
 
-The Python API handles authentication, PostgreSQL persistence, attachment processing, model-provider requests, and streamed responses. The frontend provides the chat interface, conversation history, Markdown rendering, and attachment controls. PostgreSQL stores conversations, messages, and attachment data.
+The Python API handles authentication, PostgreSQL persistence, attachment processing, model-provider requests, dynamic model discovery, and streamed responses. The frontend provides the chat interface, conversation history, Markdown rendering, and attachment controls. PostgreSQL stores conversations, messages, and attachment data. Ollama models are discovered from the local Ollama service and appear individually in the model picker.
 
 ## Requirements
 
@@ -23,14 +23,14 @@ The Python API handles authentication, PostgreSQL persistence, attachment proces
 
 ## Run locally
 
-1. Copy root `.env.example` to `.env`. Set `DATABASE_URL`, `APP_PASSWORD`, and a random `SESSION_SECRET` with at least 32 characters. Add a provider key or configure Ollama. Keep `.env` private.
+1. Copy root `.env.example` to `.env`. Set `DATABASE_URL` and a random `SESSION_SECRET` with at least 32 characters. Add a provider key or configure Ollama. Keep `.env` private. People create their own accounts through Astra’s registration page; passwords are stored as salted scrypt hashes in PostgreSQL.
 2. In a terminal at the project root, create the Python environment and install the API packages:
 
    ```powershell
-   py -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   pip install -r backend\requirements.txt
-   py -m uvicorn backend.main:app --reload --port 8000
+   py -m venv --clear .venv
+   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+   .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+   .\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
    ```
 
    The API applies `database/schema.sql` when it starts. Existing tables and chat records are retained.
@@ -45,7 +45,7 @@ The Python API handles authentication, PostgreSQL persistence, attachment proces
 
 4. Open [http://localhost:3000](http://localhost:3000).
 
-The frontend API URL defaults to `http://localhost:8000`. Configure `NEXT_PUBLIC_API_URL` in `frontend/.env.local` if the API is hosted elsewhere. Set the API's `FRONTEND_ORIGINS` to the frontend origin, and set `COOKIE_SECURE=true` when serving over HTTPS. Since authentication uses cookies, host frontend and API on the same site where possible.
+During local development, Next.js proxies `/api/*` to `http://127.0.0.1:8000`. This keeps browser requests on the frontend origin and avoids Windows `localhost` IPv4/IPv6 resolution differences. Set `ASTRA_API_PROXY_URL` in `frontend/.env.local` only if the Python API uses a different local address. For a separately hosted API, set `NEXT_PUBLIC_API_URL` and configure `FRONTEND_ORIGINS` to the frontend origin. Set `COOKIE_SECURE=true` when serving over HTTPS.
 
 ## Models
 
@@ -61,6 +61,7 @@ Set `OPENAI_MODEL`, `ANTHROPIC_MODEL`, or `OLLAMA_MODEL` in the root `.env` to a
 ## API routes
 
 - `GET /api/status`
+- `GET /api/models` — configured hosted models and models installed in Ollama
 - `POST /api/auth/login`, `POST /api/auth/logout`
 - `GET /api/conversations`
 - `GET`, `PATCH`, `DELETE /api/conversations/{id}`
@@ -68,4 +69,4 @@ Set `OPENAI_MODEL`, `ANTHROPIC_MODEL`, or `OLLAMA_MODEL` in the root `.env` to a
 - `GET /api/attachments/{id}` — authenticated image preview
 - `GET /health`
 
-This prototype uses one shared password and one private workspace. It is not configured for multiple accounts or public signup.
+Astra supports individual accounts with private conversation ownership. The first registered account adopts any legacy conversations that were created before account ownership was added.

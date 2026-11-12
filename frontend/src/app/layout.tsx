@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Astra — Your AI workspace",
-  description: "A private, personal AI chat workspace.",
+  description: "A thoughtful AI workspace for questions, ideas, and the work ahead.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

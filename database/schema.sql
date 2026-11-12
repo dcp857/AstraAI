@@ -1,11 +1,25 @@
 -- Astra conversation storage. CREATE IF NOT EXISTS keeps existing Prisma-created
 -- tables and their data intact when the Python API starts.
+CREATE TABLE IF NOT EXISTS "User" (
+  "id" TEXT PRIMARY KEY,
+  "name" TEXT NOT NULL,
+  "email" TEXT NOT NULL UNIQUE,
+  "passwordHash" TEXT NOT NULL,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS "Conversation" (
   "id" TEXT PRIMARY KEY,
   "title" TEXT NOT NULL DEFAULT 'New chat',
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE "Conversation" ADD COLUMN IF NOT EXISTS "ownerId" TEXT REFERENCES "User"("id") ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS "Conversation_ownerId_updatedAt_idx" ON "Conversation"("ownerId", "updatedAt");
+
+-- Existing Prisma-created tables may have no database default for @updatedAt.
+ALTER TABLE "Conversation" ALTER COLUMN "updatedAt" SET DEFAULT CURRENT_TIMESTAMP;
 
 CREATE TABLE IF NOT EXISTS "Message" (
   "id" TEXT PRIMARY KEY,

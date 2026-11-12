@@ -1,10 +1,11 @@
 "use client";
 
-import { Children, FormEvent, isValidElement, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { Children, FormEvent, isValidElement, KeyboardEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { PROVIDERS } from "@/lib/models";
-import { apiUrl } from "@/lib/api";
+import type { ModelOption } from "@/lib/models";
+import { apiUrl, readApiJson } from "@/lib/api";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 type ConversationSummary = { id: string; title: string; updatedAt: string };
 type AttachmentInfo = { id: string; groupId: string; fileName: string; mimeType: string; kind: "image" | "document" | "video"; byteSize: number; frameIndex?: number | null; frameTime?: number | null };
@@ -81,11 +82,12 @@ function PendingAttachmentTray({ items, onRemove }: { items: PendingAttachment[]
 function MessageAttachments({ items }: { items: AttachmentInfo[] }) {
   const groups = new Map<string, AttachmentInfo[]>();
   for (const item of items) groups.set(item.groupId, [...(groups.get(item.groupId) || []), item]);
-  return <div className="message-attachments">{[...groups.values()].map((group) => {
+  return <div className="message-attachments">{[...groups.values()].map((group, index) => {
     const first = group[0];
-    if (first.kind === "document") return <div className="document-attachment" key={first.groupId}><span className="attachment-file-icon">{first.fileName.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE"}</span><span><strong>{first.fileName}</strong><small>{(first.byteSize / 1024).toFixed(0)} KB · text extracted</small></span></div>;
-    if (first.kind === "video") return <div className="video-attachment" key={first.groupId}><div className="video-frames">{group.slice().sort((a, b) => (a.frameIndex || 0) - (b.frameIndex || 0)).map((frame) => <img key={frame.id} src={apiUrl(`/api/attachments/${frame.id}`)} alt={`${first.fileName}, frame ${frame.frameIndex}`} loading="lazy"/>)}</div><div className="video-attachment-label"><span className="video-play-icon">▶</span><span><strong>{first.fileName}</strong><small>Video · {group.length} sampled frames · audio not transcribed</small></span></div></div>;
-    return <img className="image-attachment" key={first.id} src={apiUrl(`/api/attachments/${first.id}`)} alt={first.fileName} loading="lazy"/>;
+    const key = first.groupId || first.id || `${first.kind}-${first.fileName}-${index}`;
+    if (first.kind === "document") return <div className="document-attachment" key={key}><span className="attachment-file-icon">{first.fileName.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE"}</span><span><strong>{first.fileName}</strong><small>{(first.byteSize / 1024).toFixed(0)} KB · text extracted</small></span></div>;
+    if (first.kind === "video") return <div className="video-attachment" key={key}><div className="video-frames">{group.slice().sort((a, b) => (a.frameIndex || 0) - (b.frameIndex || 0)).map((frame) => <img key={frame.id} src={apiUrl(`/api/attachments/${frame.id}`)} alt={`${first.fileName}, frame ${frame.frameIndex}`} loading="lazy"/>)}</div><div className="video-attachment-label"><span className="video-play-icon">▶</span><span><strong>{first.fileName}</strong><small>Video · {group.length} sampled frames · audio not transcribed</small></span></div></div>;
+    return <img className="image-attachment" key={key} src={apiUrl(`/api/attachments/${first.id}`)} alt={first.fileName} loading="lazy"/>;
   })}</div>;
 }
 
@@ -121,12 +123,106 @@ function relativeDate(date: string) {
   return new Date(date).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+function ProviderMark({ provider }: { provider: ModelOption["provider"] }) {
+  const mark = provider === "openai" ? "∞" : provider === "anthropic" ? "✳" : "◉";
+  return <span className={`provider-mark ${provider}`} aria-hidden="true">{mark}</span>;
+}
+
+function ModelPicker({
+  value,
+  models,
+  message,
+  loading,
+  onChange,
+  onRefresh,
+}: {
+  value: ModelOption | null;
+  models: ModelOption[];
+  message: string;
+  loading: boolean;
+  onChange: (model: ModelOption) => void;
+  onRefresh: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const hostedModels = models.filter((item) => item.kind === "hosted");
+  const localModels = models.filter((item) => item.kind === "local");
+
+  useEffect(() => {
+    function handlePointerDown(event: PointerEvent) {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  return <div className="model-picker" ref={pickerRef}>
+    <button
+      type="button"
+      className={`model-picker-trigger ${open ? "is-open" : ""}`}
+      onClick={() => setOpen((current) => !current)}
+      aria-haspopup="listbox"
+      aria-expanded={open}
+      aria-label={value ? `Choose model. Current model: ${value.label}, ${value.model}` : "Choose a model"}
+    >
+      {value ? <ProviderMark provider={value.provider}/> : <span className="provider-mark ollama" aria-hidden="true">✳</span>}
+      <span className="model-trigger-copy"><strong>{value?.label || (loading ? "Finding models…" : "Choose a model")}</strong><small>{value?.model || "Available on this PC"}</small></span>
+      <span className="model-trigger-caret" aria-hidden="true">⌄</span>
+    </button>
+    {open && <div className="model-popover">
+      <div className="model-popover-heading"><strong>Choose a model</strong><button type="button" onClick={onRefresh} disabled={loading} aria-label="Refresh available models" title="Refresh available models">{loading ? "…" : "↻"}</button></div>
+      <div className="model-options" role="listbox" aria-label="Available models">
+        {hostedModels.map((item) => <button
+          type="button"
+          role="option"
+          aria-selected={item.id === value?.id}
+          className={`model-option ${item.id === value?.id ? "selected" : ""}`}
+          key={item.id}
+          onClick={() => { onChange(item); setOpen(false); }}
+        >
+          <ProviderMark provider={item.provider}/>
+          <span className="model-option-copy"><strong>{item.label}</strong><small>{item.model}</small></span>
+          <span className="model-host-type hosted">Hosted</span>
+          {item.id === value?.id && <span className="model-selected-check" aria-label="Selected">✓</span>}
+        </button>)}
+        {localModels.length > 0 && <div className="model-group-label">On this PC <span>{localModels.length} installed</span></div>}
+        {!localModels.length && models.length > 0 && message && <div className="model-local-notice">{message}</div>}
+        {localModels.map((item) => <button
+          type="button"
+          role="option"
+          aria-selected={item.id === value?.id}
+          className={`model-option ${item.id === value?.id ? "selected" : ""}`}
+          key={item.id}
+          onClick={() => { onChange(item); setOpen(false); }}
+        >
+          <ProviderMark provider={item.provider}/>
+          <span className="model-option-copy"><strong>{item.label}</strong><small>Ollama · Open-weight</small></span>
+          <span className="model-host-type local">Local</span>
+          {item.id === value?.id && <span className="model-selected-check" aria-label="Selected">✓</span>}
+        </button>)}
+        {!models.length && <div className="model-empty-state">{message || (loading ? "Checking available models…" : "No models found.")}</div>}
+      </div>
+      {models.length > 0 && <p className="model-popover-foot">Local models run on this PC. Your chat history stays in Astra.</p>}
+    </div>}
+  </div>;
+}
+
 export function Chat() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
-  const [provider, setProvider] = useState<(typeof PROVIDERS)[number]["id"]>("ollama");
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState<ModelOption | null>(null);
+  const [modelMessage, setModelMessage] = useState("");
+  const [loadingModels, setLoadingModels] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -145,14 +241,44 @@ export function Chat() {
 
   async function refreshConversations() {
     const response = await fetch(apiUrl("/api/conversations"), { credentials: "include" });
-    const result = await response.json();
+    const result = await readApiJson(response);
     if (!response.ok) throw new Error(result.error || "Could not load chats.");
     setConversations(result.conversations);
+  }
+
+  const refreshModels = useCallback(async () => {
+    setLoadingModels(true);
+    setModelMessage("");
+    try {
+      const response = await fetch(apiUrl("/api/models"), { credentials: "include" });
+      const result = await readApiJson(response);
+      if (!response.ok) throw new Error(result.error || "Could not load available models.");
+      const available = Array.isArray(result.models) ? result.models as ModelOption[] : [];
+      setModels(available);
+      setModelMessage(result.localError || (available.length ? "" : "No configured providers or installed Ollama models were found."));
+      const savedId = localStorage.getItem("astra-selected-model");
+      setSelectedModel(available.find((model) => model.id === savedId)
+        || available.find((model) => model.provider === "ollama" && model.model === "qwen3.5:4b")
+        || available[0]
+        || null);
+    } catch (reason) {
+      setModelMessage(reason instanceof Error ? reason.message : "Could not load available models.");
+      setModels([]);
+      setSelectedModel(null);
+    } finally {
+      setLoadingModels(false);
+    }
+  }, []);
+
+  function chooseModel(model: ModelOption) {
+    setSelectedModel(model);
+    localStorage.setItem("astra-selected-model", model.id);
   }
 
   useEffect(() => {
     refreshConversations().catch((reason) => setError(reason.message)).finally(() => setLoadingChats(false));
   }, []);
+  useEffect(() => { void refreshModels(); }, [refreshModels]);
   useEffect(() => {
     if (isAtBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, busy]);
@@ -179,7 +305,7 @@ export function Chat() {
     setSidebarOpen(false);
     try {
       const response = await fetch(apiUrl(`/api/conversations/${id}`), { credentials: "include" });
-      const result = await response.json();
+      const result = await readApiJson(response);
       if (!response.ok) throw new Error(result.error || "Could not open this chat.");
       setMessages(result.conversation.messages.map((message: Message) => ({ ...message })));
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not open this chat."); }
@@ -246,6 +372,7 @@ export function Chat() {
     event?.preventDefault();
     const content = draft.trim();
     if ((!content && attachments.length === 0) || busy || processingFiles) return;
+    if (!selectedModel) { setError(modelMessage || "Choose an available model before sending a message."); return; }
     const submittedAttachments = attachments;
     const uploadParts = submittedAttachments.flatMap((group) => group.parts.map((part) => ({ ...part, group })));
     setDraft("");
@@ -260,8 +387,8 @@ export function Chat() {
       form.append("payload", JSON.stringify({
         conversationId: activeId,
         content,
-        provider,
-        model: PROVIDERS.find((item) => item.id === provider)?.model,
+        provider: selectedModel.provider,
+        model: selectedModel.model,
         attachments: uploadParts.map(({ file, group, frameIndex, frameTime }) => ({
           groupId: group.groupId,
           fileName: group.fileName,
@@ -274,7 +401,7 @@ export function Chat() {
       uploadParts.forEach(({ file }) => form.append("files", file, file.name));
       const response = await fetch(apiUrl("/api/chat"), { method: "POST", credentials: "include", body: form });
       if (!response.ok || !response.body) {
-        const result = await response.json();
+        const result = await readApiJson(response);
         throw new Error(result.error || "Could not send this message.");
       }
       const reader = response.body.getReader();
@@ -315,7 +442,10 @@ export function Chat() {
       await refreshConversations();
     } catch (reason) {
       setMessages((current) => current.at(-1)?.role === "assistant" ? current.slice(0, -1) : current);
-      setError(reason instanceof Error ? reason.message : "The response could not be completed.");
+      const fetchFailed = reason instanceof TypeError && /fetch/i.test(reason.message);
+      setError(fetchFailed
+        ? `Could not reach Astra's Python API at ${apiUrl("")} through the local proxy. Check that the backend is running on port 8000.`
+        : reason instanceof Error ? reason.message : "The response could not be completed.");
       refreshConversations().catch(() => undefined);
     } finally { setBusy(false); textareaRef.current?.focus(); }
   }
@@ -326,7 +456,7 @@ export function Chat() {
 
   async function deleteConversation(id: string) {
     const response = await fetch(apiUrl(`/api/conversations/${id}`), { method: "DELETE", credentials: "include" });
-    if (!response.ok) { const result = await response.json(); setError(result.error || "Could not delete this chat."); return; }
+    if (!response.ok) { const result = await readApiJson(response); setError(result.error || "Could not delete this chat."); return; }
     setConversations((current) => current.filter((conversation) => conversation.id !== id));
     if (activeId === id) newConversation();
   }
@@ -338,7 +468,7 @@ export function Chat() {
     const response = await fetch(apiUrl(`/api/conversations/${id}`), {
       method: "PATCH", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }),
     });
-    const result = await response.json();
+    const result = await readApiJson(response);
     if (!response.ok) { setError(result.error || "Could not rename this chat."); return; }
     setConversations((current) => current.map((item) => item.id === id ? result.conversation : item));
     setRenamingId(null);
@@ -359,16 +489,14 @@ export function Chat() {
     }
   }
 
-  const chosenProvider = PROVIDERS.find((item) => item.id === provider)!;
-
   return <main className="app-shell">
     <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
       <div className="sidebar-top">
         <a className="brand-lockup" href="/" aria-label="Astra home"><div className="brand-mark">✳</div><span>astra</span></a>
         <button className="icon-button mobile-close" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar">×</button>
       </div>
-      <button className="new-chat-button" onClick={newConversation}><span className="plus-icon">＋</span> New conversation <span className="shortcut">⌘ K</span></button>
-      <div className="history-label">RECENT</div>
+      <button className="new-chat-button" onClick={newConversation}><span className="plus-icon">＋</span> New conversation</button>
+      <div className="history-label">Recent chats</div>
       <div className="conversation-list">
         {loadingChats ? <div className="sidebar-empty">Loading conversations…</div> : conversations.length === 0
           ? <div className="sidebar-empty">Your conversations<br />will live here.</div>
@@ -386,8 +514,8 @@ export function Chat() {
           </div>)}
       </div>
       <div className="sidebar-bottom">
-        <div className="profile-avatar">Y</div><div className="profile-copy"><strong>Your workspace</strong><span>Personal plan</span></div>
-        <button className="icon-button logout-button" onClick={() => void logout()} aria-label="Sign out" title="Sign out">↗</button>
+        <div className="profile-avatar" aria-hidden="true">A</div><div className="profile-copy"><strong>Your account</strong><span>Private conversations</span></div>
+        <button className="logout-button" onClick={() => void logout()} aria-label="Sign out" title="Sign out"><span aria-hidden="true">↗</span><span>Sign out</span></button>
       </div>
     </aside>
     {sidebarOpen && <button className="mobile-scrim" aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} />}
@@ -395,7 +523,7 @@ export function Chat() {
       <header className="topbar">
         <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">☰</button>
         <div className="workspace-crumb"><span>Workspace</span><span className="crumb-slash">/</span><strong>{activeId ? conversations.find((item) => item.id === activeId)?.title || "Conversation" : "New conversation"}</strong></div>
-        <div className="topbar-right"><span className="online-indicator"/>All systems normal</div>
+        <div className="topbar-right"><span className="online-indicator"/>Private workspace<ThemeToggle/></div>
       </header>
       <div ref={chatScrollRef} onScroll={handleChatScroll} className={`chat-scroll ${messages.length === 0 ? "chat-empty" : ""}`}>
         {messages.length === 0 ? <div className="welcome-block">
@@ -428,7 +556,7 @@ export function Chat() {
           <textarea ref={textareaRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onComposerKeyDown} placeholder={attachments.length ? "Ask something about these files…" : "Message Astra…"} rows={1} maxLength={12000} aria-label="Your message" />
           <div className="composer-toolbar">
             <div className="composer-tools"><button type="button" className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={busy || processingFiles} aria-label="Attach image, video, or document" title="Attach image, video, or document">＋<span>Attach</span></button>
-              <label className="model-select-wrap" aria-label="Choose an AI model"><span className="model-sparkle">✳</span><select value={provider} onChange={(event) => setProvider(event.target.value as typeof provider)}>{PROVIDERS.map((item) => <option key={item.id} value={item.id}>{item.label} · {item.model}</option>)}</select><span className="select-caret">⌄</span></label></div>
+              <ModelPicker value={selectedModel} models={models} message={modelMessage} loading={loadingModels} onChange={chooseModel} onRefresh={() => void refreshModels()}/></div>
             <div className="composer-actions"><span className="enter-hint">↵ to send · shift + ↵ for new line</span><button type="submit" className="send-button" disabled={busy || processingFiles || (!draft.trim() && attachments.length === 0)} aria-label="Send message">{busy ? <span className="send-spinner"/> : "↑"}</button></div>
           </div>
         </form>

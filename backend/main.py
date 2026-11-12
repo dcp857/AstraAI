@@ -5,8 +5,10 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -67,9 +69,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Astra Python API", version="1.0.0", lifespan=lifespan)
+logger = logging.getLogger("astra.api")
+local_dev_origin_regex = r"https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$" if os.getenv("COOKIE_SECURE", "false").lower() != "true" else None
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[item.strip() for item in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if item.strip()],
+    allow_origin_regex=local_dev_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
@@ -80,6 +85,17 @@ app.add_middleware(
 async def http_error_response(request: Request, error: HTTPException):
     detail = error.detail if isinstance(error.detail, str) else "Request failed."
     return JSONResponse({"error": detail}, status_code=error.status_code, headers=error.headers)
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_response(request: Request, error: Exception):
+    logger.exception("Unhandled API error for %s %s", request.method, request.url.path)
+    client_host = request.client.host if request.client else ""
+    if client_host in {"127.0.0.1", "::1"}:
+        detail = f"{type(error).__name__}: {error}"[:500]
+    else:
+        detail = "Internal server error. Check the Python backend terminal for details."
+    return JSONResponse({"error": detail}, status_code=500)
 
 
 def pool(request: Request) -> asyncpg.Pool:
@@ -93,34 +109,103 @@ def same_origin(request: Request) -> bool:
     origin = request.headers.get("origin")
     if not origin:
         return False
+    normalized = origin.rstrip("/").lower()
     allowed = {item.strip().rstrip("/").lower() for item in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")}
-    return origin.rstrip("/").lower() in allowed
+    if normalized in allowed:
+        return True
+    return bool(local_dev_origin_regex and re.fullmatch(local_dev_origin_regex, normalized))
 
 
 def auth_configured() -> bool:
-    return bool(os.getenv("APP_PASSWORD") and len(os.getenv("SESSION_SECRET", "")) >= 32)
+    return len(os.getenv("SESSION_SECRET", "")) >= 32
 
 
-def session_signature(expiry: str) -> str:
+def session_signature(expiry: str, user_id: str) -> str:
     secret = os.getenv("SESSION_SECRET", "")
     if len(secret) < 32:
         raise ValueError("SESSION_SECRET must contain at least 32 characters.")
-    digest = hmac.new(secret.encode(), expiry.encode(), hashlib.sha256).digest()
+    digest = hmac.new(secret.encode(), f"{expiry}.{user_id}".encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
-def has_session(request: Request) -> bool:
+def current_user_id(request: Request) -> str | None:
     raw = request.cookies.get(COOKIE_NAME, "")
     try:
-        expiry, signature = raw.split(".", 1)
-        return expiry.isdigit() and int(expiry) >= int(datetime.now(timezone.utc).timestamp()) and hmac.compare_digest(signature, session_signature(expiry))
+        expiry, user_id, signature = raw.split(".", 2)
+        valid = expiry.isdigit() and int(expiry) >= int(datetime.now(timezone.utc).timestamp()) and hmac.compare_digest(signature, session_signature(expiry, user_id))
+        return user_id if valid else None
+    except (ValueError, TypeError):
+        return None
+
+
+def has_session(request: Request) -> bool:
+    return current_user_id(request) is not None
+
+
+def require_session(request: Request) -> None:
+    if current_user_id(request) is None:
+        raise HTTPException(401, "Unauthorized.")
+
+
+def owner_id(request: Request) -> str:
+    value = current_user_id(request)
+    if value is None:
+        raise HTTPException(401, "Sign in to continue.")
+    return value
+
+
+def password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    hashed = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=64)
+    return f"scrypt${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(hashed).decode()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algorithm, salt_value, hash_value = stored.split("$", 2)
+        if algorithm != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_value.encode())
+        expected = base64.urlsafe_b64decode(hash_value.encode())
+        actual = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=len(expected))
+        return hmac.compare_digest(actual, expected)
     except (ValueError, TypeError):
         return False
 
 
-def require_session(request: Request) -> None:
-    if not has_session(request):
-        raise HTTPException(401, "Unauthorized.")
+async def discover_models() -> tuple[list[dict[str, str]], str | None]:
+    models: list[dict[str, str]] = []
+    for provider in ("openai", "anthropic"):
+        config = PROVIDERS[provider]
+        if os.getenv(config["env"]):
+            models.append({
+                "id": f"{provider}:{config['model']}",
+                "provider": provider,
+                "label": config["label"],
+                "model": config["model"],
+                "kind": "hosted",
+            })
+
+    ollama_base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+    ollama_root = ollama_base[:-3] if ollama_base.endswith("/v1") else ollama_base
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3, connect=2)) as client:
+            response = await client.get(f"{ollama_root}/api/tags")
+            response.raise_for_status()
+            entries = response.json().get("models", [])
+        for entry in entries:
+            name = entry.get("name") or entry.get("model")
+            if isinstance(name, str) and name:
+                models.append({
+                    "id": f"ollama:{name}",
+                    "provider": "ollama",
+                    "label": name,
+                    "model": name,
+                    "kind": "local",
+                })
+        return models, None
+    except (httpx.HTTPError, ValueError, TypeError):
+        return models, "Ollama isn't responding. Start Ollama, then refresh the model list."
 
 
 def json_error(status: int, message: str) -> JSONResponse:
@@ -132,22 +217,65 @@ async def status(request: Request):
     return {"configured": auth_configured() and bool(os.getenv("DATABASE_URL")), "authenticated": has_session(request)}
 
 
-class LoginBody(BaseModel):
+@app.get("/api/models")
+async def list_models(request: Request):
+    require_session(request)
+    models, local_error = await discover_models()
+    return {"models": models, "localError": local_error}
+
+
+class AuthBody(BaseModel):
+    email: str
     password: str
+    name: str = ""
+
+
+def set_session(response: JSONResponse, user_id: str) -> JSONResponse:
+    expiry = str(int(datetime.now(timezone.utc).timestamp()) + SESSION_AGE)
+    token = f"{expiry}.{user_id}.{session_signature(expiry, user_id)}"
+    response.set_cookie(COOKIE_NAME, token, httponly=True, secure=os.getenv("COOKIE_SECURE", "false").lower() == "true", samesite="strict", path="/", max_age=SESSION_AGE)
+    return response
+
+
+@app.post("/api/auth/register")
+async def register(body: AuthBody, request: Request):
+    if not same_origin(request):
+        raise HTTPException(403, "Invalid request origin.")
+    if not auth_configured():
+        raise HTTPException(503, "SESSION_SECRET must be set to at least 32 characters.")
+    email = body.email.strip().lower()
+    name = re.sub(r"\s+", " ", body.name.strip())[:80]
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254:
+        raise HTTPException(400, "Enter a valid email address.")
+    if len(body.password) < 10 or len(body.password) > 256:
+        raise HTTPException(400, "Use a password between 10 and 256 characters.")
+    if not name:
+        raise HTTPException(400, "Enter your name.")
+    user_id = str(uuid.uuid4())
+    db = pool(request)
+    try:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute('INSERT INTO "User" ("id", "name", "email", "passwordHash") VALUES ($1,$2,$3,$4)', user_id, name, email, password_hash(body.password))
+                # Preserve the existing single-user workspace for the first account.
+                await conn.execute('UPDATE "Conversation" SET "ownerId"=$1 WHERE "ownerId" IS NULL', user_id)
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(409, "An account with this email already exists.")
+    response = JSONResponse({"ok": True, "user": {"id": user_id, "name": name, "email": email}})
+    return set_session(response, user_id)
 
 
 @app.post("/api/auth/login")
-async def login(body: LoginBody, request: Request):
+async def login(body: AuthBody, request: Request):
     if not same_origin(request):
         raise HTTPException(403, "Invalid request origin.")
     if not auth_configured():
         raise HTTPException(503, "Authentication is not configured.")
-    if not hmac.compare_digest(body.password.encode(), os.getenv("APP_PASSWORD", "").encode()):
-        raise HTTPException(401, "That password did not match.")
-    expiry = str(int(datetime.now(timezone.utc).timestamp()) + SESSION_AGE)
-    response = JSONResponse({"ok": True})
-    response.set_cookie(COOKIE_NAME, f"{expiry}.{session_signature(expiry)}", httponly=True, secure=os.getenv("COOKIE_SECURE", "false").lower() == "true", samesite="strict", path="/", max_age=SESSION_AGE)
-    return response
+    user = await pool(request).fetchrow('SELECT "id", "name", "email", "passwordHash" FROM "User" WHERE "email"=$1', body.email.strip().lower())
+    if not user or not verify_password(body.password, user["passwordHash"]):
+        raise HTTPException(401, "Email or password is incorrect.")
+    response = JSONResponse({"ok": True, "user": {"id": user["id"], "name": user["name"], "email": user["email"]}})
+    return set_session(response, user["id"])
 
 
 @app.post("/api/auth/logout")
@@ -161,16 +289,16 @@ async def logout(request: Request):
 
 @app.get("/api/conversations")
 async def list_conversations(request: Request):
-    require_session(request)
-    rows = await pool(request).fetch('SELECT "id", "title", "updatedAt" FROM "Conversation" ORDER BY "updatedAt" DESC')
+    user_id = owner_id(request)
+    rows = await pool(request).fetch('SELECT "id", "title", "updatedAt" FROM "Conversation" WHERE "ownerId"=$1 ORDER BY "updatedAt" DESC', user_id)
     return {"conversations": [{"id": row["id"], "title": row["title"], "updatedAt": row["updatedAt"].isoformat()} for row in rows]}
 
 
 @app.get("/api/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str, request: Request):
-    require_session(request)
+    user_id = owner_id(request)
     db = pool(request)
-    conversation = await db.fetchrow('SELECT "id", "title", "updatedAt" FROM "Conversation" WHERE "id"=$1', conversation_id)
+    conversation = await db.fetchrow('SELECT "id", "title", "updatedAt" FROM "Conversation" WHERE "id"=$1 AND "ownerId"=$2', conversation_id, user_id)
     if not conversation:
         raise HTTPException(404, "Chat not found.")
     rows = await db.fetch('''SELECT m."id", m."role", m."content", m."model", m."createdAt",
@@ -187,13 +315,13 @@ class RenameBody(BaseModel):
 
 @app.patch("/api/conversations/{conversation_id}")
 async def rename_conversation(conversation_id: str, body: RenameBody, request: Request):
-    require_session(request)
+    user_id = owner_id(request)
     if not same_origin(request):
         raise HTTPException(403, "Invalid request origin.")
     title = body.title.strip()
     if not title or len(title) > 100:
         raise HTTPException(400, "Title must be between 1 and 100 characters.")
-    row = await pool(request).fetchrow('UPDATE "Conversation" SET "title"=$2, "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1 RETURNING "id", "title", "updatedAt"', conversation_id, title)
+    row = await pool(request).fetchrow('UPDATE "Conversation" SET "title"=$2, "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1 AND "ownerId"=$3 RETURNING "id", "title", "updatedAt"', conversation_id, title, user_id)
     if not row:
         raise HTTPException(404, "Chat not found.")
     return {"conversation": {"id": row["id"], "title": row["title"], "updatedAt": row["updatedAt"].isoformat()}}
@@ -201,10 +329,10 @@ async def rename_conversation(conversation_id: str, body: RenameBody, request: R
 
 @app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str, request: Request):
-    require_session(request)
+    user_id = owner_id(request)
     if not same_origin(request):
         raise HTTPException(403, "Invalid request origin.")
-    result = await pool(request).execute('DELETE FROM "Conversation" WHERE "id"=$1', conversation_id)
+    result = await pool(request).execute('DELETE FROM "Conversation" WHERE "id"=$1 AND "ownerId"=$2', conversation_id, user_id)
     if result.endswith("0"):
         raise HTTPException(404, "Chat not found.")
     return {"ok": True}
@@ -308,6 +436,11 @@ async def provider_tokens(provider: str, model: str, messages: list[dict[str, An
         url = "https://api.anthropic.com/v1/messages"
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
         body = {"model": model, "max_tokens": 4096, "messages": formatted, "stream": True}
+    if provider == "ollama" and model.lower().startswith("gemma4"):
+        # Gemma 4 thinks by default; on this machine that can leave the
+        # OpenAI-compatible stream idle long enough for the dev proxy to drop it.
+        body["reasoning_effort"] = "none"
+        body["max_tokens"] = 2048
     async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20)) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code >= 400:
@@ -339,7 +472,7 @@ def sse(name: str, value: Any) -> str:
 
 @app.post("/api/chat")
 async def chat(request: Request, payload: str = Form(...), files: list[UploadFile] = File(default=[])):
-    require_session(request)
+    user_id = owner_id(request)
     if not same_origin(request):
         raise HTTPException(403, "Invalid request origin.")
     if int(request.headers.get("content-length", "0") or 0) > MAX_REQUEST_BYTES:
@@ -358,7 +491,13 @@ async def chat(request: Request, payload: str = Form(...), files: list[UploadFil
         if provider not in PROVIDERS:
             raise ValueError("Choose a supported model provider.")
         config = PROVIDERS[provider]
-        model = body.get("model") if body.get("model") == config["model"] else config["model"]
+        if provider == "ollama":
+            model = body.get("model")
+            available_models, _ = await discover_models()
+            if not isinstance(model, str) or not any(item["provider"] == "ollama" and item["model"] == model for item in available_models):
+                raise HTTPException(400, "That local model isn't available in Ollama. Refresh the model list and choose an installed model.")
+        else:
+            model = config["model"]
         if config["env"] and not os.getenv(config["env"]):
             raise HTTPException(503, f"{config['label']} is not configured yet. Add {config['env']} to your .env file.")
         processed = await process_files(body, files)
@@ -373,18 +512,18 @@ async def chat(request: Request, payload: str = Form(...), files: list[UploadFil
     async with db.acquire() as conn:
         async with conn.transaction():
             if conversation_id:
-                exists = await conn.fetchval('SELECT "id" FROM "Conversation" WHERE "id"=$1', str(conversation_id))
+                exists = await conn.fetchval('SELECT "id" FROM "Conversation" WHERE "id"=$1 AND "ownerId"=$2', str(conversation_id), user_id)
                 if not exists:
                     raise HTTPException(404, "Chat not found.")
             else:
                 conversation_id = str(uuid.uuid4())
                 title = re.sub(r"\s+", " ", content or (names[0] if names else "New chat"))[:56]
-                await conn.execute('INSERT INTO "Conversation" ("id", "title") VALUES ($1,$2)', conversation_id, title or "New chat")
+                await conn.execute('INSERT INTO "Conversation" ("id", "title", "updatedAt", "ownerId") VALUES ($1,$2,CURRENT_TIMESTAMP,$3)', conversation_id, title or "New chat", user_id)
             user_message_id = str(uuid.uuid4())
             await conn.execute('INSERT INTO "Message" ("id", "conversationId", "role", "content") VALUES ($1,$2,$3,$4)', user_message_id, conversation_id, "user", stored_content)
             for attachment in processed:
                 await conn.execute('''INSERT INTO "Attachment" ("id", "messageId", "groupId", "fileName", "mimeType", "kind", "byteSize", "frameIndex", "frameTime", "data", "extractedText") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)''', attachment["id"], user_message_id, attachment["groupId"], attachment["fileName"], attachment["mimeType"], attachment["kind"], attachment["byteSize"], attachment["frameIndex"], attachment["frameTime"], attachment["data"], attachment["extractedText"])
-            await conn.execute('UPDATE "Conversation" SET "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1', conversation_id)
+            await conn.execute('UPDATE "Conversation" SET "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1 AND "ownerId"=$2', conversation_id, user_id)
     stored = await db.fetch('''SELECT m."id",m."role",m."content",a."fileName",a."mimeType",a."kind",a."data",a."extractedText",a."frameIndex"
       FROM (SELECT * FROM "Message" WHERE "conversationId"=$1 ORDER BY "createdAt" DESC LIMIT 24) m
       LEFT JOIN "Attachment" a ON a."messageId"=m."id" ORDER BY m."createdAt" ASC''', conversation_id)
@@ -433,7 +572,7 @@ async def chat(request: Request, payload: str = Form(...), files: list[UploadFil
             if not answer.strip():
                 raise RuntimeError("The model returned an empty response.")
             await db.execute('INSERT INTO "Message" ("id","conversationId","role","content","provider","model") VALUES ($1,$2,$3,$4,$5,$6)', str(uuid.uuid4()), conversation_id, "assistant", answer, provider, model)
-            await db.execute('UPDATE "Conversation" SET "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1', conversation_id)
+            await db.execute('UPDATE "Conversation" SET "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1 AND "ownerId"=$2', conversation_id, user_id)
             yield sse("done", {"conversationId": conversation_id})
         except asyncio.CancelledError:
             raise
@@ -446,8 +585,11 @@ async def chat(request: Request, payload: str = Form(...), files: list[UploadFil
 
 @app.get("/api/attachments/{attachment_id}")
 async def get_attachment(attachment_id: str, request: Request):
-    require_session(request)
-    row = await pool(request).fetchrow('SELECT "data", "mimeType" FROM "Attachment" WHERE "id"=$1', attachment_id)
+    user_id = owner_id(request)
+    row = await pool(request).fetchrow('''SELECT a."data", a."mimeType" FROM "Attachment" a
+      JOIN "Message" m ON m."id"=a."messageId"
+      JOIN "Conversation" c ON c."id"=m."conversationId"
+      WHERE a."id"=$1 AND c."ownerId"=$2''', attachment_id, user_id)
     if not row or row["data"] is None:
         raise HTTPException(404, "Image not found.")
     return Response(row["data"], media_type=row["mimeType"], headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"})
